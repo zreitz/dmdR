@@ -1,0 +1,296 @@
+---
+title: "DmdR1"
+author: Zach Reitz
+date: 21/07/2023
+output: html_notebook
+---
+```{r}
+source("regulation.R")
+library("corrplot")
+library(ggplot2)
+library(gggenes)
+library(ggrepel)
+library(data.table)
+library(svglite)
+```
+
+## Load correlation matrix generated in 1_read_processing.rmd
+```{r}
+cors <- readRDS(file="cors.Rda")
+```
+
+## Load and parse predicted DmdR1 binding sites
+
+```{r parse-tfbs}
+## Load predictions
+raw <- utils::read.table("DmdR1_Streptomyces_coelicolor_reg_pwm_results.tsv", sep = "\t", header = T)
+
+## Parse table and remove very low scores
+parsed <- parseTFBS(raw, min_score = 15)
+
+## Remove plasmid genes (not present in this strain)
+parsed <- parsed[!startsWith(parsed$Region, "SCP"), ]
+
+## To determine if a site is upstream of a gene, we need the strand info
+path <- "extdata/raw_counts_all_samples.txt"
+count_info <- read.table(path, sep='\t', header=TRUE, stringsAsFactors=FALSE)
+count_info <- count_info[1:7767,]
+
+## Remove genes that facing the wrong way
+filtered_sites <- filterTFBS(parsed, count_info)
+```
+
+## Find correlations between *dmdR1* and predicted binding sites
+```{r}
+## Get all cors
+dmdr_cors <- cors[, "SCO4394"]
+
+
+filtered_sites$Gene1Cor <- dmdr_cors[filtered_sites$Gene1]
+filtered_sites$Gene2Cor <- dmdr_cors[filtered_sites$Gene2]
+```
+
+## Plot the correlations of top hits
+```{r, fig.width = 9, fig.height = 7}
+pdf("dmdr_correlations.pdf", width = 10, height = 7)
+
+## Prepare for printing
+layout(matrix(c(1,2), nrow = 1), widths = c(7,3))
+
+df <- data.frame(Gene = c(filtered_sites$Gene1, filtered_sites$Gene2),
+                 Score = filtered_sites$Score,
+                 Cor = c(filtered_sites$Gene1Cor, filtered_sites$Gene2Cor))
+df <- df[!is.na(df$Gene), ]
+
+plot(df$Score, df$Cor,
+     ylim = c(-1,1),
+     pch = 19,
+     col = scales::alpha("black", 0.5),
+     xlab = "DmdR1 position weight matrix (PWM) score",
+     ylab = expression(paste("Pearson correlation coefficient (PCC) with", italic("  dmdR1"))),
+     oma = c(0,0,0,0)
+)
+abline(v = 22.875, lty = 2)
+abline(h = 0.43, lty = 3)
+abline(h = -0.43, lty = 3)
+
+## Find genes that have a score above the cutoff
+sig_hits <- filtered_sites[filtered_sites$Score > 22.875, ]
+
+mat <- as.matrix(sig_hits[,c("Gene1Cor", "Gene2Cor")])
+rownames(mat) <- rep("", nrow(mat))
+colnames(mat) <- c("-", "+")
+## Correlation plot of top genes
+par(xpd=TRUE)
+corrplot::corrplot(mat,
+                    method = "square",
+                    tl.col = "black",
+                    tl.cex = 1.4,
+                    tl.srt = 0,
+                    cl.pos = "n",
+                    mar = c(0,0,3,5),
+                    na.label = "\u00D7",
+                    na.label.col = "darkgray"
+)
+text(-1, seq(nrow(mat), 1, by = -1), sig_hits$Gene1)
+text(4, seq(nrow(mat), 1, by = -1), sig_hits$Gene2)
+col2 <- colorRampPalette(c('#67001F', '#B2182B', '#D6604D', '#F4A582',
+                           '#FDDBC7', '#FFFFFF', '#D1E5F0', '#92C5DE',
+                           '#4393C3', '#2166AC', '#053061'))(200)
+corrplot::colorlegend(col2,
+                      seq(-1,1,.2),
+                      xlim = c(6,7), ylim = c(15,23),
+                      align = "l",
+                      ratio.colbar = 0.6,
+                      cex = 0.8,
+
+)
+mtext("Genes with predicted DmdR1\nsites (PWM score > 22.875)",
+      line = 1, font = 1)
+
+dev.off()
+```
+
+## Expand the DmdR1 regulon by including operonic/coexpressed genes
+```{r}
+## Form simple operons based on intergenic distance and strand
+operons <- suppressWarnings(predictOperons(count_info, c(-50, 250)))
+
+## Split the operons with a PCC cutoff
+operons <- splitByCoexpression(operons, cors, min_cor = 0.6)
+
+## Find operons with the high-scoring genes
+sig_genes <- c(sig_hits$Gene1, sig_hits$Gene2)
+sig_genes <- sig_genes[!is.na(sig_genes)]
+hit_operons <- operons[unlist(lapply(sig_genes, function(x) grep(x, operons)))]
+## Sort and dereplicate
+hit_operons <- unique(hit_operons[order(unlist(lapply(hit_operons, utils::head, 1)))])
+
+## Clean up operons based on DmdR1 sites
+for (i in seq_along(hit_operons)) {
+  operon <- hit_operons[[i]]
+  if (!operon[1] %in% sig_genes) {
+    message(paste(operon, collapse = "-"))
+    message(paste0("\t", operon[1], " doesn't have a DmdR1 site"))
+    new_op <- operon[min(which(operon %in% sig_genes)):length(operon)]
+    message(paste("\tReplacing with", paste(new_op, collapse = "-")))
+    hit_operons[[i]] <- new_op
+  }
+}
+```
+
+
+## Plotting genes in the predicted DmdR1 regulon
+```{r}
+## Neighboring operons should be combined into one plot
+regulon <- sort(unlist(hit_operons))
+regions <- clusterTags(regulon, 10)
+
+## Slice out the ranges of the gene table
+## All regions are continuous so I don't have to worry about the innards
+region_info <- lapply(regions, function(x) getRowRange(count_info, x[1], x[length(x)], match_col = "Geneid", padding = 1))
+
+## Get cors to dmdR1 for a padded region
+region_genes <- unlist(sapply(region_info, with, Geneid))
+region_genes_expr <- region_genes[region_genes %in% rownames(cors)]
+missing <- region_genes[!region_genes %in% rownames(cors)]
+dmdr_cors2 <- cors[region_genes_expr, "SCO4394"]
+missing_vec <- rep(NA, length = length(missing))
+names(missing_vec) <- missing
+dmdr_cors2 <- c(dmdr_cors2, missing_vec)    # Gotta be a better way
+```
+
+```{r, fig.width = 10, fig.height = 20}
+## Make tables for gggenes
+region_tables <- lapply(region_info, function(region) {
+  label <- region$Geneid
+  label <- sprintf("%04d", extractGeneNumber(label))
+  label[c(1,nrow(region))] <- ""
+  data.frame("Cluster" = rep(region[1,1], nrow(region)),       # Dummy value
+             "Gene" = region$Geneid,
+             "Start" = as.integer(region$Start),
+             "Mid" = (as.integer(region$End) + as.integer(region$Start))/2,
+             "End" = as.integer(region$End),
+             "Orientation" = region$Strand == "+",
+             "Cor" = as.numeric(dmdr_cors2[region$Geneid]),
+             "Label" = label
+  )
+})
+gene_table <- rbindlist(region_tables)
+segment_table <- rbindlist(lapply(region_info, function(region) {
+  list("Cluster" = region[1,1],
+       "Start" = as.integer(region$Start)[2],
+       "End" = as.integer(region$End)[nrow(region)-1])
+}))
+
+## Find the widest cluster to preserve scaling
+max_span <- max(unlist(lapply(region_tables, function(x) x$End[nrow(x)] - x$Start[1])))
+
+dummies <- lapply(region_tables, function(x) {
+  list("Cluster" = x$Cluster[1],
+       "Start" = x$Start[1],
+       "End" = x$Start[1] + max_span,
+       "Cor" = 0,
+       "Orientation" = 0
+  )
+})
+dummy_table <- rbindlist(dummies)
+
+cor_colors <- c('#67001F', '#B2182B', '#D6604D', '#F4A582',
+                '#FDDBC7', '#FFFFFF', '#D1E5F0', '#92C5DE',
+                '#4393C3', '#2166AC', '#053061')
+
+### Prepare the TFBS table
+high_sites <- sig_hits
+high_sites$Midpoint <- unlist(lapply(strsplit(high_sites$Location, ":"), function(x) mean(as.numeric(x))))
+high_sites$Cluster <- unlist(lapply(high_sites$Midpoint, function(x) dummy_table$Cluster[max(which(x > dummy_table$Start))]))
+
+gene_plot <- ggplot(gene_table, aes(xmin = Start, xmax = End,
+                                    y = Cluster, fill = Cor,
+                                    forward = Orientation)) +
+  ## Add arrows
+  geom_gene_arrow(arrowhead_height = unit(8, "mm"),
+                    arrowhead_width = unit(3, "mm"),
+                    arrow_body_height = unit(8,"mm")) +
+
+  ## Make all scales the same
+  geom_blank(data = dummy_table) +
+  facet_wrap(~ Cluster, scales = "free", ncol = 1) +
+
+  ## Set minimal theme
+  theme_genes() +
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.line.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.title.y=element_blank()) +
+  ## Set color gradient
+  scale_fill_gradientn(colours = cor_colors, limits = c(-1,1),
+                       name = "PCC with\nDmdR1") +
+
+  ## Add gene labels
+  geom_text_repel(aes(x = Mid, label = Label, angle = 45),
+                  box.padding = 0.12,
+                  segment.colour = NA,
+                  nudge_x = -0.7, nudge_y = -.38,
+                  direction = "x") +
+
+
+  ## Add DmdR1 sites
+  geom_point(data = high_sites, aes(x = Midpoint, y = Cluster), inherit.aes = F,
+             pch = 21, size = 3,
+             col = "navyblue", fill = "white", stroke = 1.5) +
+
+
+  ## Add segments over the regulon
+  geom_segment(data = segment_table, aes(x = Start, xend = End,
+                                         y = Cluster, yend = Cluster),
+               inherit.aes = F, size = 1.5)
+
+
+
+```
+
+```{r}
+## Requires svglite
+ggsave("dmdr_regulon.svg", gene_plot, width = 10, height = 20)
+```
+
+
+```{r}
+within <- cors[sig_genes, sig_genes]
+within <- abs(unlist(within[lower.tri(within)]))
+without <- abs(cors[sig_genes, "SCO4394"])
+
+wilcox.test(within, without, alternative = "greater")
+
+median(within)
+median(without)
+```
+
+
+```{r}
+library(reshape2)
+
+tmm <- readRDS(file="tmm.rda")
+tmm <- scale(t(tmm))
+
+for (g in sig_genes) {
+    expr <- data.frame(conds = rownames(tmm), DmdR = tmm[, "SCO4394"], Gene = tmm[, g])
+
+    print(ggplot(expr, aes(x = DmdR, y = Gene, label = conds)) +
+               geom_point() + geom_text(nudge_x = 0.15) + theme_bw(base_size = 15) + ylab(g))
+}
+
+
+expr_reg <- tmm[, sig_genes]
+df <- reshape2::melt(expr_reg)
+
+
+df$DmdR <- tmm[, "SCO4394"]
+
+
+ggplot(df, aes(x = DmdR, y = value, color = Var1, group = Var1)) + geom_point() +
+ theme_bw(base_size = 15)
+```

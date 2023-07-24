@@ -1,0 +1,116 @@
+---
+title: "Read processing"
+author: Zach Reitz
+date: 21/07/2023
+output: html_notebook
+---
+```{r}
+source("read_processing.R")
+
+library("WGCNA")
+library("spqn")
+library("gridExtra")
+library("edgeR")
+```
+
+## Processing RNA-Seq reads
+```{r setup}
+path <- "extdata/raw_counts_all_samples.txt"
+raw_counts <- read.table(path, sep='\t', header=TRUE, stringsAsFactors=FALSE)
+
+## Counts is the starting point for the rest of the analyses
+counts <- raw_counts[1:7767,7:28]
+
+## Clean up sample names
+colnames(counts) <- gsub("_counts", "", colnames(counts))
+```
+
+
+## Read Processing
+```{r}
+## Get a vector of all gene names
+all_genes <- raw_counts$Geneid[1:7767]
+rownames(counts) <- all_genes
+counts <- counts[,order(colnames(counts))]
+
+## Filter low counts
+counts <- filterLowExpression(counts, cutoff = 5, fraction = 0.5)
+```
+
+```{r}
+## Convert to log2-TMM
+tmm <- logTMM(counts, 2)
+
+saveRDS(tmm, "tmm.rda")
+
+## Sort by mean expression for later corAndSpQN()
+tmm <- tmm[order(rowMeans(tmm)),]
+```
+
+```{r cor-bias}
+# all to all correlation
+cors <- WGCNA::cor(t(tmm))
+# Remove duplicates, convert to vector
+cor_v <- as.vector(cors[lower.tri(cors)])
+print(mean(cor_v))
+print(fivenum(cor_v))
+```
+
+```{r expression-bias, fig.width = 10, fig.height = 7}
+plotA <- plotBinnedCorDensity(cors, title = "Uncorrected")
+```
+
+
+```{r PC-removal}
+less_pc <- removePCs(tmm, 1)
+```
+
+```{r cor-bias-after}
+# all to all correlation
+cors <- WGCNA::cor(t(less_pc))
+# Remove duplicates, convert to vector
+cor_v <- as.vector(cors[lower.tri(cors)])
+print(mean(cor_v))
+print(fivenum(cor_v))
+```
+
+```{r expression-bias-after, fig.width = 10, fig.height = 7}
+plotB <- plotBinnedCorDensity(cors, title = "Minus 1 PC")
+```
+
+
+```{r cor-and-SpQN}
+## Matrix is already sorted
+means <- seq_len(nrow(less_pc))
+names(means) <- rownames(less_pc)
+
+## Find PCC and determine minimum
+cor_pack <- WGCNA::corAndPvalue(t(less_pc))
+cors <- cor_pack$cor
+
+cors[which.min(abs(cor_pack$p-0.05))]
+cor_pack$p[which.min(abs(cors-0.43))]
+
+## SpQN correction
+post_spqn <- spqn::normalize_correlation(cors, ave_exp = means, ngrp = 20,
+                                         size_grp = round(nrow(less_pc) / 20 * 1.15),
+                                         ref_grp = 18)
+dimnames(post_spqn) <- dimnames(cors)
+
+## Final sorting by gene name
+cor_sorted <- cors[sort(rownames(post_spqn)),sort(rownames(post_spqn))]
+
+## Save the correlations
+saveRDS(cor_sorted, file = "cors.Rda")
+```
+
+
+```{r, fig.width = 10, fig.height = 7}
+plotC <- plotBinnedCorDensity(cor_sorted, title = "Post-SpQN")
+```
+
+
+```{r, fig.width = 10, fig.height = 15}
+gridExtra::grid.arrange(plotA + theme(axis.title.x = element_blank()), plotB + theme(axis.title.x = element_blank()), plotC, nrow = 3)
+```
+
